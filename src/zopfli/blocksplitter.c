@@ -309,7 +309,7 @@ void ZopfliBlockSplit(const ZopfliOptions* options,
 
   /* Blocksplitting likely wont improve compression on small files */
   if (inend - instart < options->noblocksplit){
-    *stats = (SymbolStats*)malloc(sizeof(SymbolStats));
+    //*stats = (SymbolStats*)malloc(sizeof(SymbolStats));
     GetStatistics(&store, *stats);
     ZopfliCleanLZ77Store(&store);
     return;
@@ -317,7 +317,7 @@ void ZopfliBlockSplit(const ZopfliOptions* options,
 
   ZopfliBlockSplitLZ77(store.litlens, store.dists, store.size, &lz77splitpoints, &nlz77points, options, store.symbols);
 
-  *stats = (SymbolStats*)realloc(*stats, (nlz77points + prevpoints + 1) * sizeof(SymbolStats));
+  //*stats = (SymbolStats*)realloc(*stats, (nlz77points + prevpoints + 1) * sizeof(SymbolStats));
   if (!(*stats)){
     exit(1);
   }
