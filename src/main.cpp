@@ -1,13 +1,14 @@
 //  main.cpp
 //  Efficient Compression Tool
-//  Created by Felix Hanau on 19.12.14.
-//  Copyright (c) 2014-2016 Felix Hanau.
+//  Created by Felix Hanau on 12/19/14.
+//  Copyright (c) 2014-2019 Felix Hanau.
 
 #include "main.h"
 #include "support.h"
 #include "miniz/miniz.h"
 #include <unistd.h>
 #include <limits.h>
+#include <atomic>
 
 #ifndef NOMULTI
 #include <thread>
@@ -17,14 +18,18 @@
 #include <id3/tag.h>
 #endif
 
-static size_t processedfiles;
-static size_t bytes;
-static long long savings;
+#ifdef _WIN32
+#include <Windows.h>
+#endif
+
+static std::atomic<size_t> processedfiles;
+static std::atomic<size_t> bytes;
+static std::atomic<long long> savings;
 
 static void Usage() {
     printf (
             "Efficient Compression Tool\n"
-            "(c) 2014-2017 Felix Hanau.\n"
+            "(c) 2014-2019 Felix Hanau.\n"
             "Version 0.8.2"
 #ifdef __DATE__
             " compiled on %s\n"
@@ -64,7 +69,9 @@ static void Usage() {
             " --pal_sort=i   Try i different PNG palette filtering strategies (up to 120)\n"
 #ifndef NOMULTI
             " --mt-deflate   Use per block multithreading in Deflate\n"
-            " --mt-deflate=i Use per block multithreading in Deflate, use i threads\n"
+            " --mt-deflate=i Use per block multithreading in Deflate with i threads\n"
+            " --mt-file      Use per file multithreading\n"
+            " --mt-file=i    Use per file multithreading with i threads\n"
 #endif
             //" --arithmetic   Use arithmetic encoding for JPEGs, incompatible with most software\n"
 #ifdef __DATE__
@@ -73,18 +80,29 @@ static void Usage() {
             );
 }
 
+static void RenameAndReplace(const char * Infile, const char * Outfile){
+#ifdef _WIN32
+    MoveFileExA(Infile, Outfile, MOVEFILE_REPLACE_EXISTING);
+#else
+    rename(Infile, Outfile);
+#endif
+}
+
 static void ECT_ReportSavings(){
-    if (processedfiles){
-        printf("Processed %zu file%s\n", processedfiles, processedfiles > 1 ? "s":"");
-        if (savings < 0){
+    size_t localProcessedFiles = processedfiles.load(std::memory_order_seq_cst);
+    size_t localBytes = bytes.load(std::memory_order_seq_cst);
+    long long localSavings = savings.load(std::memory_order_seq_cst);
+    if (localProcessedFiles){
+        printf("Processed %zu file%s\n", localProcessedFiles, localProcessedFiles > 1 ? "s":"");
+        if (localSavings < 0){
             printf("Result is bigger\n");
             return;
         }
 
         int bk = 0;
         int k = 0;
-        double smul = savings;
-        double bmul = bytes;
+        double smul = localSavings;
+        double bmul = localBytes;
         while (smul > 1024) {smul /= 1024; k++;}
         while (bmul > 1024) {bmul /= 1024; bk++;}
         char *counter;
@@ -103,7 +121,7 @@ static void ECT_ReportSavings(){
         printf("%sB out of ", counter);
         if (bk == 0){printf("%0.0f", bmul);}
         else{printf("%0.2f", bmul);}
-        printf("%sB (%0.4f%%)\n", counter2, (100.0 * savings)/bytes);}
+        printf("%sB (%0.4f%%)\n", counter2, (100.0 * localSavings)/localBytes);}
     else {printf("No compatible files found\n");}
 }
 
@@ -128,27 +146,24 @@ static int ECTGzip(const char * Infile, const unsigned Mode, unsigned char multi
         ZopfliGzip(Infile, 0, Mode, multithreading, ZIP);
         return 1;
     }
-    else {
-        if (exists(((std::string)Infile).append(".ungz").c_str())){
-            return 2;
-        }
-        if (exists(((std::string)Infile).append(".ungz.gz").c_str())){
-            return 2;
-        }
-        if(ungz(Infile, ((std::string)Infile).append(".ungz").c_str())){
-            return 2;
-        }
-        ZopfliGzip(((std::string)Infile).append(".ungz").c_str(), 0, Mode, multithreading, ZIP);
-        if (filesize(((std::string)Infile).append(".ungz.gz").c_str()) < filesize(Infile)){
-            unlink(Infile);
-            rename(((std::string)Infile).append(".ungz.gz").c_str(), Infile);
-        }
-        else {
-            unlink(((std::string)Infile).append(".ungz.gz").c_str());
-        }
-        unlink(((std::string)Infile).append(".ungz").c_str());
-        return 0;
+    if (exists(((std::string)Infile).append(".ungz").c_str())){
+        return 2;
     }
+    if (exists(((std::string)Infile).append(".ungz.gz").c_str())){
+        return 2;
+    }
+    if(ungz(Infile, ((std::string)Infile).append(".ungz").c_str())){
+        return 2;
+    }
+    ZopfliGzip(((std::string)Infile).append(".ungz").c_str(), 0, Mode, multithreading, ZIP);
+    if (filesize(((std::string)Infile).append(".ungz.gz").c_str()) < filesize(Infile)){
+        RenameAndReplace(((std::string)Infile).append(".ungz.gz").c_str(), Infile);
+    }
+    else {
+        unlink(((std::string)Infile).append(".ungz.gz").c_str());
+    }
+    unlink(((std::string)Infile).append(".ungz").c_str());
+    return 0;
 }
 
 static unsigned char OptimizePNG(const char * Infile, const ECTOptions& Options){
@@ -157,6 +172,8 @@ static unsigned char OptimizePNG(const char * Infile, const ECTOptions& Options)
     if (mode == 1 && Options.Reuse){
         mode++;
     }
+    unsigned quiet = !Options.SavingsCounter;
+
     int x = 1;
     long long size = filesize(Infile);
     if(size < 0){
@@ -164,7 +181,7 @@ static unsigned char OptimizePNG(const char * Infile, const ECTOptions& Options)
         return 1;
     }
     if(mode == 9 && !Options.Reuse && !Options.Allfilters){
-        x = Zopflipng(Options.strip, Infile, Options.Strict, 3, 0, Options.DeflateMultithreading);
+        x = Zopflipng(Options.strip, Infile, Options.Strict, 3, 0, Options.DeflateMultithreading, quiet);
         if(x < 0){
             return 1;
         }
@@ -184,32 +201,32 @@ static unsigned char OptimizePNG(const char * Infile, const ECTOptions& Options)
     }
     if (mode != 1){
         if (Options.Allfilters){
-            x = Zopflipng(Options.strip, Infile, Options.Strict, _mode, 6 + Options.palette_sort, Options.DeflateMultithreading);
+            x = Zopflipng(Options.strip, Infile, Options.Strict, _mode, 6 + Options.palette_sort, Options.DeflateMultithreading, quiet);
             if(x < 0){
                 return 1;
             }
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 5 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 1 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 2 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 3 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 4 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 7 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 8 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 11 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 12 + Options.palette_sort, Options.DeflateMultithreading);
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 13 + Options.palette_sort, Options.DeflateMultithreading);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 5 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 1 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 2 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 3 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 4 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 7 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 8 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 11 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 12 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, 13 + Options.palette_sort, Options.DeflateMultithreading, quiet);
             if (Options.Allfiltersbrute){
-                Zopflipng(Options.strip, Infile, Options.Strict, _mode, 9 + Options.palette_sort, Options.DeflateMultithreading);
-                Zopflipng(Options.strip, Infile, Options.Strict, _mode, 10 + Options.palette_sort, Options.DeflateMultithreading);
-                Zopflipng(Options.strip, Infile, Options.Strict, _mode, 14 + Options.palette_sort, Options.DeflateMultithreading);
+                Zopflipng(Options.strip, Infile, Options.Strict, _mode, 9 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+                Zopflipng(Options.strip, Infile, Options.Strict, _mode, 10 + Options.palette_sort, Options.DeflateMultithreading, quiet);
+                Zopflipng(Options.strip, Infile, Options.Strict, _mode, 14 + Options.palette_sort, Options.DeflateMultithreading, quiet);
             }
         }
         else if (mode == 9){
-            Zopflipng(Options.strip, Infile, Options.Strict, _mode, filter + Options.palette_sort, Options.DeflateMultithreading);
+            Zopflipng(Options.strip, Infile, Options.Strict, _mode, filter + Options.palette_sort, Options.DeflateMultithreading, quiet);
         }
         else {
-            x = Zopflipng(Options.strip, Infile, Options.Strict, _mode, filter + Options.palette_sort, Options.DeflateMultithreading);
+            x = Zopflipng(Options.strip, Infile, Options.Strict, _mode, filter + Options.palette_sort, Options.DeflateMultithreading, quiet);
             if(x < 0){
                 return 1;
             }
@@ -220,8 +237,7 @@ static unsigned char OptimizePNG(const char * Infile, const ECTOptions& Options)
             unlink(((std::string)Infile).append(".bak").c_str());
         }
         else {
-            unlink(Infile);
-            rename(((std::string)Infile).append(".bak").c_str(), Infile);
+            RenameAndReplace(((std::string)Infile).append(".bak").c_str(), Infile);
         }
     }
 
@@ -244,6 +260,7 @@ static unsigned char OptimizeJPEG(const char * Infile, const ECTOptions& Options
 }
 
 #ifdef MP3_SUPPORTED
+#error MP3 code may corrupt metadata.
 static void OptimizeMP3(const char * Infile, const ECTOptions& Options){
     ID3_Tag orig (Infile);
     size_t start = orig.Size();
@@ -307,13 +324,13 @@ unsigned fileHandler(const char * Infile, const ECTOptions& Options, int interna
                 }
             }
             if(Options.SavingsCounter && !internal){
-                processedfiles++;
-                bytes += size;
+                processedfiles.fetch_add(1);
+                bytes.fetch_add(size);
                 if (!statcompressedfile){
-                savings = savings + size - filesize(Infile);
+                savings.fetch_add(size - filesize(Infile));
                 }
                 else if (statcompressedfile){
-                    savings += (size - filesize(((std::string)Infile).append(Options.Zip ? ".zip" : ".gz").c_str()));
+                    savings.fetch_add((size - filesize(((std::string)Infile).append(Options.Zip ? ".zip" : ".gz").c_str())));
                 }
             }
         }
@@ -464,27 +481,37 @@ unsigned zipHandler(std::vector<int> args, const char * argv[], int files, const
                 printf("can't add file '%s'\n", argv[0]);
                 free(file); error = 1; continue;
             }
-            else{
-                local_bytes += filesize(argv[args[i]]);
-            }
+            local_bytes += filesize(argv[args[i]]);
 
             free(file);
 
         }
     }
-
-    ReZipFile(zipfilename.c_str(), Options, &processedfiles);
+    size_t localProcessedFiles = 0;
+    ReZipFile(zipfilename.c_str(), Options, &localProcessedFiles);
+    processedfiles.fetch_add(localProcessedFiles);
     if(t >= 0){
         set_file_time(zipfilename.c_str(), t);
     }
 
-    bytes += local_bytes;
-    savings += local_bytes - filesize(zipfilename.c_str());
+    bytes.fetch_add(local_bytes);
+    savings.fetch_add(local_bytes - filesize(zipfilename.c_str()));
     return error;
 }
 
+static void multithreadFileLoop(const std::vector<std::string> &fileList, std::atomic<size_t> *pos, const ECTOptions &options, std::atomic<unsigned> *error) {
+    while (true) {
+        size_t nextPos = pos->fetch_add(1);
+        if (nextPos >= fileList.size()) {
+            break;
+        }
+        unsigned localError = fileHandler(fileList[nextPos].c_str(), options, 0);
+        error->fetch_or(localError);
+    }
+}
+
 int main(int argc, const char * argv[]) {
-    unsigned error = 0;
+    std::atomic<unsigned> error(0);
     ECTOptions Options;
     Options.strip = false;
     Options.Progressive = false;
@@ -500,6 +527,7 @@ int main(int argc, const char * argv[]) {
     Options.SavingsCounter = true;
     Options.Strict = false;
     Options.DeflateMultithreading = 0;
+    Options.FileMultithreading = 0;
     Options.Reuse = 0;
     Options.Allfilters = 0;
     Options.Allfiltersbrute = 0;
@@ -556,6 +584,14 @@ int main(int argc, const char * argv[]) {
                     Options.DeflateMultithreading = std::thread::hardware_concurrency();
                 }
             }
+            else if (strncmp(argv[i], "--mt-file", 9) == 0) {
+                if (strncmp(argv[i], "--mt-file=", 10) == 0){
+                    Options.FileMultithreading = atoi(argv[i] + 10);
+                }
+                else if (strcmp(argv[i], "--mt-file") == 0) {
+                    Options.FileMultithreading = std::thread::hardware_concurrency();
+                }
+            }
 #endif
             else if (strcmp(argv[i], "--arithmetic") == 0) {Options.Arithmetic = true;}
             else {printf("Unknown flag: %s\n", argv[i]); return 0;}
@@ -563,27 +599,28 @@ int main(int argc, const char * argv[]) {
         if(Options.Reuse){
             Options.Allfilters = 0;
         }
-        if(Options.Zip){
+        if(Options.Zip && files){
             error |= zipHandler(args, argv, files, Options);
         }
         else {
+            std::vector<std::string> fileList;
             for (int j = 0; j < files; j++){
 #ifdef BOOST_SUPPORTED
                 if (boost::filesystem::is_regular_file(argv[args[j]])){
-                    error |= fileHandler(argv[args[j]], Options, 0);
+                    fileList.push_back(argv[args[j]]);
                 }
                 else if (boost::filesystem::is_directory(argv[args[j]])){
                     if(Options.Recurse){boost::filesystem::recursive_directory_iterator a(argv[args[j]]), b;
                         std::vector<boost::filesystem::path> paths(a, b);
                         for(unsigned i = 0; i < paths.size(); i++){
-                            error |= fileHandler(paths[i].string().c_str(), Options, 0);
+                            fileList.push_back(paths[i].string());
                         }
                     }
                     else{
                         boost::filesystem::directory_iterator a(argv[args[j]]), b;
                         std::vector<boost::filesystem::path> paths(a, b);
                         for(unsigned i = 0; i < paths.size(); i++){
-                            error |= fileHandler(paths[i].string().c_str(), Options, 0);
+                            fileList.push_back(paths[i].string());
                         }
                     }
                 }
@@ -591,9 +628,30 @@ int main(int argc, const char * argv[]) {
                     error = 1;
                 }
 #else
-                error |= fileHandler(argv[args[j]], Options, 0);
+                fileList.push_back(argv[args[j]]);
 #endif
             }
+#ifndef NOMULTI
+            if (Options.FileMultithreading) {
+                std::vector<std::thread> threads;
+                std::atomic<size_t> pos(0);
+                for (int i = 0; i < Options.FileMultithreading; i++) {
+                    threads.emplace_back(multithreadFileLoop, fileList, &pos, Options, &error);
+                }
+                for (auto &thread : threads) {
+                    thread.join();
+                }
+            }
+            else {
+                for (const auto& file : fileList) {
+                    error |= fileHandler(file.c_str(), Options, 0);
+                }
+            }
+#else
+            for (const auto& file : fileList) {
+                error |= fileHandler(file.c_str(), Options, 0);
+            }
+#endif
         }
 
         if(!files){Usage();}
@@ -601,5 +659,5 @@ int main(int argc, const char * argv[]) {
         if(Options.SavingsCounter){ECT_ReportSavings();}
     }
     else {Usage();}
-    return error;
+    return error.load(std::memory_order_seq_cst);
 }
