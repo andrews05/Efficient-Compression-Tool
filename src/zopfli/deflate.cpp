@@ -1117,30 +1117,30 @@ struct BlockData {
 };
 
 static void DeflateDynamicBlock2(const ZopfliOptions* options, const unsigned char* in,
-								 BlockData** instore, BlockData** blockend, std::mutex& mtx, std::mutex& endmtx) {
+                                 BlockData** instore, BlockData** blockend, std::mutex& mtx, std::mutex& endmtx) {
   for(;;) {
-	  BlockData* store;
-	while (true) {
-		mtx.lock();
-		store = *instore;
-		//printf("%lu %p %p\n", std::hash<std::thread::id>()(std::this_thread::get_id()), store, *blockend);
-		if(store != *blockend) break;
-		if (endmtx.try_lock()) {
-		  endmtx.unlock();
-		  mtx.unlock();
-		  return;
-		}
-		mtx.unlock();
-		endmtx.lock();
-		endmtx.unlock();
-	}
+    BlockData* store;
+    while (true) {
+      mtx.lock();
+      store = *instore;
+      //printf("%lu %p %p\n", std::hash<std::thread::id>()(std::this_thread::get_id()), store, *blockend);
+      if(store != *blockend) break;
+      if (endmtx.try_lock()) {
+        endmtx.unlock();
+        mtx.unlock();
+        return;
+      }
+      mtx.unlock();
+      endmtx.lock();
+      endmtx.unlock();
+    }
     (*instore)++;
     mtx.unlock();
     size_t instart = store->start;
     size_t inend = store->end;
     size_t blocksize = inend - instart;
     store->btype = 2;
-	  
+    
     ZopfliInitLZ77Store(&store->store);
     
     if (blocksize <= options->skipdynamic){
@@ -1198,7 +1198,7 @@ static void DeflateSplittingFirst2(
   BlockData* blockend = data + numblocks;
   std::mutex mtx;
   for (i = 0; i < threads; i++) {
-    multi[i] = std::thread(DeflateDynamicBlock2,options, in, &data, blockend, std::ref(mtx));
+    //multi[i] = std::thread(DeflateDynamicBlock2,options, in, &data, blockend, std::ref(mtx));
   }
   for(std::thread& t : multi) {
     t.join();
@@ -1282,7 +1282,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
     std::mutex endmtx;
     endmtx.lock();
     unsigned char twiceMode = options->twice && it != options->twice;
-	  
+
     while (i < insize) {
       if(it == 0 && options->twice){
         ZopfliInitLZ77Store(lf + mblocks);
@@ -1294,7 +1294,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
       if(i + size < insize){
         ZOPFLI_APPEND_DATA(i + size, &splitpoints, &npoints);
       }
-		
+
       printf("%lu %lu %lu\n", i, d.size(), npoints);
       mtx.lock();
       while (numblocks < npoints) {
@@ -1316,7 +1316,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
       mtx.unlock();
       endmtx.unlock();
       endmtx.lock();
-		
+
       if (i == 0) {
         threads = options->multithreading;
         if(threads > numblocks){
@@ -1338,11 +1338,11 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
     for (size_t j = 0; j < threads; j++){
       multi[j].join();
     }
-    
+
     if (twiceMode & 1){
       int j = 0;
       size_t mnext = msize;
-    
+
       for(;;){
         ZopfliInitLZ77Store(lf);
         for(; j < numblocks; j++){
@@ -1359,7 +1359,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
             break;
           }
         }
-      
+
         if(j == numblocks){
           break;
         }
@@ -1370,7 +1370,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
       for (i = 0; i < numblocks; i++) {
         size_t start = i == 0 ? 0 : splitpoints[i - 1];
         size_t end = i == npoints ? insize : splitpoints[i];
-      
+
         AddLZ77Block(d[i].btype, i == npoints && final,
                      d[i].store.litlens, d[i].store.dists, d[i].store.size,
                      end - start, bp, out, outsize, options->searchext, in, start, options->replaceCodes, options->advanced);
@@ -1379,7 +1379,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
         }
       }
     }
-    
+
     free(splitpoints);
     free(stats);
   }
