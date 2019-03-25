@@ -1130,7 +1130,9 @@ static void DeflateDynamicBlock2(const ZopfliOptions* options, const unsigned ch
         //printf("%lu %lu\n", std::hash<std::thread::id>()(std::this_thread::get_id()), store->start);
         break;
       }
-      if (end) return;
+      if (end) {
+        return;
+      }
       //printf("%lu wait\n", std::hash<std::thread::id>()(std::this_thread::get_id()));
       cv.wait(lock);
     }
@@ -1267,7 +1269,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
     size_t i = 0;
     size_t npoints = 0;
     size_t* splitpoints = 0;
-    SymbolStats* stats = (SymbolStats*)malloc((int)(insize/25000) * sizeof(SymbolStats));
+    SymbolStats* stats = 0;
 
     unsigned mblocks = 0;
     unsigned numblocks = 0;
@@ -1278,10 +1280,10 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
     unsigned threads;
     std::mutex mtx;
     std::condition_variable cv;
-    bool end = false;
+    bool splitComplete = false;
     unsigned char twiceMode = options->twice && it != options->twice;
 
-    while (!end) {
+    while (i < insize) {
       if(it == 0 && options->twice){
         ZopfliInitLZ77Store(lf + mblocks);
       }
@@ -1313,7 +1315,9 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
         it1 = d.insert_after(it1, data);
         numblocks++;
       }
+      splitComplete = masterfinal;
       mtx.unlock();
+      cv.notify_all();
 
       if (i == 0) {
         threads = options->multithreading;
@@ -1323,38 +1327,37 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
         multi.resize(threads);
         if (!masterfinal) threads--;
         for (size_t j = 0; j < threads; j++) {
-          multi[j] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(cv), std::ref(end));
+          multi[j] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(cv), std::ref(splitComplete));
         }
       } else if (masterfinal) {
-        multi[threads++] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(cv), std::ref(end));
+        multi[threads++] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(cv), std::ref(splitComplete));
       }
       mblocks++;
       i += size;
-      end = i == insize;
-      cv.notify_all();
     }
-    //printf("joining %d %d\n", mblocks, numblocks);
+    printf("joining %d %d\n", mblocks, numblocks);
     for (std::thread& t : multi){
       t.join();
     }
 
     if (twiceMode & 1){
-      size_t mnext = msize;
+      ZopfliLZ77Store* twiceStore = lf;
+      size_t mnext = 0;
 
       for (BlockData data : d) {
-        if (data.start == msize) {
-          ZopfliInitLZ77Store(lf);
+        if (data.start == mnext) {
+          ZopfliInitLZ77Store(twiceStore);
+          mnext += msize;
         }
-        lf->litlens = (unsigned short*)realloc(lf->litlens, sizeof(unsigned short) * (lf->size + data.store.size));
-        lf->dists = (unsigned short*)realloc(lf->dists, sizeof(unsigned short) * (lf->size + data.store.size));
-        memcpy(lf->litlens + lf->size, data.store.litlens, data.store.size * sizeof(unsigned short));
-        memcpy(lf->dists + lf->size, data.store.dists, data.store.size * sizeof(unsigned short));
+        twiceStore->litlens = (unsigned short*)realloc(twiceStore->litlens, sizeof(unsigned short) * (twiceStore->size + data.store.size));
+        twiceStore->dists = (unsigned short*)realloc(twiceStore->dists, sizeof(unsigned short) * (twiceStore->size + data.store.size));
+        memcpy(twiceStore->litlens + twiceStore->size, data.store.litlens, data.store.size * sizeof(unsigned short));
+        memcpy(twiceStore->dists + twiceStore->size, data.store.dists, data.store.size * sizeof(unsigned short));
         free(data.store.dists);
         free(data.store.litlens);
-        lf->size += data.store.size;
-        if(data.end == mnext){
-          mnext += msize;
-          lf++;
+        twiceStore->size += data.store.size;
+        if (data.end == mnext) {
+          twiceStore++;
         }
       }
     }
