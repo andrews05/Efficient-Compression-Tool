@@ -1119,27 +1119,21 @@ struct BlockData {
 
 static void DeflateDynamicBlock2(const ZopfliOptions* options, const unsigned char* in,
                                  std::forward_list<BlockData>::iterator& instore, std::forward_list<BlockData>::iterator& blockend,
-                                 std::mutex& mtx, std::mutex& endmtx) {
+                                 std::mutex& mtx, std::condition_variable& cv, bool& end) {
   for(;;) {
     BlockData* store;
     while (true) {
-      mtx.lock();
+      std::unique_lock<std::mutex> lock(mtx);
       if(instore != blockend) {
         instore++;
         store = &*instore;
         //printf("%lu %lu\n", std::hash<std::thread::id>()(std::this_thread::get_id()), store->start);
         break;
       }
-      if (endmtx.try_lock()) {
-        endmtx.unlock();
-        mtx.unlock();
-        return;
-      }
-      mtx.unlock();
-      endmtx.lock();
-      endmtx.unlock();
+      if (end) return;
+      //printf("%lu wait\n", std::hash<std::thread::id>()(std::this_thread::get_id()));
+      cv.wait(lock);
     }
-    mtx.unlock();
     size_t instart = store->start;
     size_t inend = store->end;
     size_t blocksize = inend - instart;
@@ -1283,11 +1277,11 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
     std::vector<std::thread> multi;
     unsigned threads;
     std::mutex mtx;
-    std::mutex endmtx;
-    endmtx.lock();
+    std::condition_variable cv;
+    bool end = false;
     unsigned char twiceMode = options->twice && it != options->twice;
 
-    while (i < insize) {
+    while (!end) {
       if(it == 0 && options->twice){
         ZopfliInitLZ77Store(lf + mblocks);
       }
@@ -1299,7 +1293,7 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
         ZOPFLI_APPEND_DATA(i + size, &splitpoints, &npoints);
       }
 
-      printf("%lu %lu\n", i, npoints);
+      //printf("%lu %lu\n", i, npoints);
       mtx.lock();
       while (numblocks < npoints) {
         BlockData data;
@@ -1320,8 +1314,6 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
         numblocks++;
       }
       mtx.unlock();
-      endmtx.unlock();
-      endmtx.lock();
 
       if (i == 0) {
         threads = options->multithreading;
@@ -1331,18 +1323,19 @@ static void ZopfliDeflateMulti(const ZopfliOptions* options, int final,
         multi.resize(threads);
         if (!masterfinal) threads--;
         for (size_t j = 0; j < threads; j++) {
-          multi[j] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(endmtx));
+          multi[j] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(cv), std::ref(end));
         }
       } else if (masterfinal) {
-        multi[threads++] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(endmtx));
+        multi[threads++] = std::thread(DeflateDynamicBlock2,options, in, std::ref(it2), std::ref(it1), std::ref(mtx), std::ref(cv), std::ref(end));
       }
       mblocks++;
       i += size;
+      end = i == insize;
+      cv.notify_all();
     }
-    endmtx.unlock();
-    printf("joining %d %d\n", mblocks, numblocks);
-    for (size_t j = 0; j < threads; j++){
-      multi[j].join();
+    //printf("joining %d %d\n", mblocks, numblocks);
+    for (std::thread& t : multi){
+      t.join();
     }
 
     if (twiceMode & 1){
